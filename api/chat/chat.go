@@ -22,7 +22,7 @@ func Stream(c *gin.Context) {
 	}
 
 	// 使用请求上下文创建 DeepSeek 流，客户端断开时能及时取消请求。
-	stream, err := chatservice.NewDeepSeekStream(c.Request.Context(), req.Message)
+	stream, err := chatservice.NewDeepSeekStream(c.Request.Context(), req.Message, req.History)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
