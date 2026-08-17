@@ -12,6 +12,7 @@ import (
 
 	"server/config"
 	chatrequest "server/models/chat/request"
+	"server/services"
 )
 
 const defaultAgentInstruction = "You are a helpful assistant."
@@ -44,10 +45,17 @@ func NewDeepSeekStream(ctx context.Context, message string, history []chatreques
 		return nil, err
 	}
 
+	instruction := defaultAgentInstruction
+	// 尝试获取 RAG 上下文
+	contextStr, _ := services.RetrieveContext(message)
+	if contextStr != "" {
+		instruction = "你是一个智能助理，请根据提供的上下文来回答用户的问题。如果上下文中没有包含相关信息，请如实回答不知道，不要瞎编。\n\n上下文信息如下：\n" + contextStr
+	}
+
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:        "ChatMateAgent",
 		Description: "A stateless ChatModelAgent using frontend persisted history.",
-		Instruction: defaultAgentInstruction,
+		Instruction: instruction,
 		Model:       chatModel,
 	})
 	if err != nil {

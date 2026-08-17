@@ -2,6 +2,7 @@ package routes
 
 import (
 	chatapi "server/api/chat"
+	ragapi "server/api/rag"
 	v1 "server/api/v1"
 	"server/middleware"
 
@@ -15,6 +16,7 @@ func SetupRouter() *gin.Engine {
 
 	registerV1Routes(router)
 	registerChatRoutes(router)
+	registerRagRoutes(router)
 
 	return router
 }
@@ -28,4 +30,10 @@ func registerV1Routes(router *gin.Engine) {
 func registerChatRoutes(router *gin.Engine) {
 	chatGroup := router.Group("/api/chat")
 	chatGroup.POST("/stream", chatapi.Stream)
+}
+
+// registerRagRoutes 注册 RAG 模块路由。
+func registerRagRoutes(router *gin.Engine) {
+	ragGroup := router.Group("/api/rag")
+	ragGroup.POST("/upload", ragapi.UploadMarkdown)
 }
