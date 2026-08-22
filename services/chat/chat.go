@@ -2,12 +2,13 @@ package chat
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
+	"log"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/deepseek"
-	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
 	"server/config"
@@ -22,19 +23,31 @@ type TextChunk struct {
 	Content string
 }
 
-// DeepSeekAgentStream 把 ADK Runner 事件流转换成简单的文本分片流。
+// RAGInput 定义 RAG Chain 的输入数据结构 (固定写法/标准结构)
+type RAGInput struct {
+	Message string
+	History []chatrequest.ChatHistoryMessage
+}
+
+// RAGState 定义 RAG Chain 在检索完成后的中间状态 (固定写法/标准结构)
+type RAGState struct {
+	Input   RAGInput
+	Context string
+}
+
+// DeepSeekAgentStream 把 Eino Chain 输出的流式响应包装为前端需要的分片流。
 type DeepSeekAgentStream struct {
-	events        *adk.AsyncIterator[*adk.AgentEvent]
 	messageStream *schema.StreamReader[*schema.Message]
 }
 
-// NewDeepSeekStream 根据历史消息和当前用户消息创建 Agent 流式响应。
+// NewDeepSeekStream 根据历史消息和当前用户消息创建 RAG Chain 并开启流式响应 (固定写法/标准用法)
 func NewDeepSeekStream(ctx context.Context, message string, history []chatrequest.ChatHistoryMessage) (*DeepSeekAgentStream, error) {
 	cfg, err := config.LoadDeepSeekConfig()
 	if err != nil {
 		return nil, err
 	}
 
+	// 1. 初始化 ChatModel 聊天模型节点
 	chatModel, err := deepseek.NewChatModel(ctx, &deepseek.ChatModelConfig{
 		APIKey:  cfg.APIKey,
 		BaseURL: cfg.BaseURL,
@@ -45,97 +58,83 @@ func NewDeepSeekStream(ctx context.Context, message string, history []chatreques
 		return nil, err
 	}
 
-	instruction := defaultAgentInstruction
-	// 尝试获取 RAG 上下文
-	contextStr, _ := services.RetrieveContext(message)
-	if contextStr != "" {
-		instruction = "你是一个智能助理，请根据提供的上下文来回答用户的问题。如果上下文中没有包含相关信息，请如实回答不知道，不要瞎编。\n\n上下文信息如下：\n" + contextStr
-	}
+	// 2. 初始化线性编排链条 compose.NewChain (固定写法/标准用法)
+	// 输入类型为 RAGInput (问答+历史)，输出最终的模型消息
+	chain := compose.NewChain[RAGInput, *schema.Message]()
 
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "ChatMateAgent",
-		Description: "A stateless ChatModelAgent using frontend persisted history.",
-		Instruction: instruction,
-		Model:       chatModel,
-	})
+	// 节点 1：调用 Eino Retriever 检索向量数据库 (固定写法/标准用法)
+	// 作用：根据当前 Query 检索 Qdrant，拿到 Top3 相关背景并封装到 RAGState 中传递
+	chain.AppendLambda(compose.InvokableLambda(func(ctx context.Context, in RAGInput) (RAGState, error) {
+		contextStr, err := services.RetrieveContext(in.Message)
+		if err != nil {
+			log.Printf("[RAG] Retrieve context failed: %v", err)
+			// 检索异常作降级处理，不打断核心问答
+		}
+		return RAGState{Input: in, Context: contextStr}, nil
+	}), compose.WithNodeName("RetrieveContext"))
+
+	// 节点 2：拼装与格式化系统及用户提示词 (固定写法/标准用法)
+	// 作用：接收中间状态，动态格式化 System Instruction（拼接召回的 RAG 上下文）以及把多轮 History 转化为 Eino 标准的消息列表
+	chain.AppendLambda(compose.InvokableLambda(func(ctx context.Context, state RAGState) ([]*schema.Message, error) {
+		instruction := defaultAgentInstruction
+		if state.Context != "" {
+			instruction = "你是一个智能助理，请根据提供的上下文来回答用户的问题。如果上下文中没有包含相关信息，请如实回答不知道，不要瞎编。\n\n上下文信息如下：\n" + state.Context
+		}
+
+		messages := []*schema.Message{
+			schema.SystemMessage(instruction),
+		}
+
+		for _, item := range state.Input.History {
+			switch item.Role {
+			case "user":
+				messages = append(messages, schema.UserMessage(item.Content))
+			case "assistant":
+				messages = append(messages, schema.AssistantMessage(item.Content, nil))
+			}
+		}
+
+		messages = append(messages, schema.UserMessage(state.Input.Message))
+
+		return messages, nil
+	}), compose.WithNodeName("FormatPrompt"))
+
+	// 节点 3：关联 LLM 大模型生成节点 (固定写法/标准用法)
+	// 作用：将格式化后的消息列表送给 DeepSeek 模型进行推理生成
+	chain.AppendChatModel(chatModel)
+
+	// 3. 编译整条编排链路为可运行对象 (固定写法/标准用法)
+	runnable, err := chain.Compile(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("compile RAG chain failed: %w", err)
 	}
 
-	runner := adk.NewRunner(ctx, adk.RunnerConfig{
-		Agent:           agent,
-		EnableStreaming: true,
-	})
-
-	messages := BuildModelMessages(history, message)
+	// 4. 以流式方法（Stream）执行链条 (固定写法/标准用法)
+	// 特性：由于最终节点是 ChatModel 且支持 Stream，Eino 会自动将前端非流式的 Lambda 节点
+	// 以 Invoke 方式顺序调用，到 ChatModel 节点时自动开启 Stream 输出。
+	messageStream, err := runnable.Stream(ctx, RAGInput{Message: message, History: history})
+	if err != nil {
+		return nil, fmt.Errorf("run RAG chain stream failed: %w", err)
+	}
 
 	return &DeepSeekAgentStream{
-		events: runner.Run(ctx, messages),
+		messageStream: messageStream,
 	}, nil
 }
 
-// BuildModelMessages 把前端历史消息和当前用户输入转换成 Eino 标准消息。
-func BuildModelMessages(history []chatrequest.ChatHistoryMessage, message string) []adk.Message {
-	messages := make([]adk.Message, 0, len(history)+1)
-
-	for _, item := range history {
-		// 前端只允许 user / assistant；这里仍按 role 显式转换，避免消息角色混乱。
-		switch item.Role {
-		case "user":
-			messages = append(messages, schema.UserMessage(item.Content))
-		case "assistant":
-			messages = append(messages, schema.AssistantMessage(item.Content, nil))
-		}
-	}
-
-	messages = append(messages, schema.UserMessage(message))
-
-	return messages
-}
-
-// Recv 读取下一段 assistant 文本，屏蔽 ADK event 和 MessageStream 的细节。
+// Recv 读取下一段 assistant 文本，屏蔽 MessageStream 的细节。
 func (s *DeepSeekAgentStream) Recv() (*TextChunk, error) {
-	for {
-		if s.messageStream != nil {
-			chunk, err := s.messageStream.Recv()
-			if errors.Is(err, io.EOF) {
-				s.messageStream.Close()
-				s.messageStream = nil
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			if chunk == nil || chunk.Content == "" {
-				continue
-			}
-
-			return &TextChunk{Content: chunk.Content}, nil
-		}
-
-		event, ok := s.events.Next()
-		if !ok {
-			return nil, io.EOF
-		}
-		if event == nil {
-			continue
-		}
-		if event.Err != nil {
-			return nil, event.Err
-		}
-		if event.Output == nil || event.Output.MessageOutput == nil {
-			continue
-		}
-
-		output := event.Output.MessageOutput
-		if output.IsStreaming && output.MessageStream != nil {
-			s.messageStream = output.MessageStream
-			continue
-		}
-		if output.Message != nil && output.Message.Content != "" {
-			return &TextChunk{Content: output.Message.Content}, nil
-		}
+	if s.messageStream == nil {
+		return nil, io.EOF
 	}
+	chunk, err := s.messageStream.Recv()
+	if err != nil {
+		return nil, err // 包含 io.EOF 退出信号
+	}
+	if chunk == nil {
+		return nil, io.EOF
+	}
+	return &TextChunk{Content: chunk.Content}, nil
 }
 
 // Close 关闭当前正在读取的模型分片流。
